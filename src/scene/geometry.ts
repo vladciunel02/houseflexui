@@ -46,9 +46,11 @@ export function roofPoint(x: number, s: number, h: number): THREE.Vector3 {
 }
 
 // ---------- cables ----------
-/** Tube radius (was 0.026). */
-export const CABLE_R = 0.015;
-/** Centre-line offset from the surface a cable is fixed to: radius + 2.5 mm. */
+/** Tube radius of a cable with no energy flowing (|power| < 0.05 kW). */
+export const CABLE_R = 0.012;
+/** Tube radius of a cable carrying energy. */
+export const CABLE_R_ACTIVE = 0.03;
+/** Centre-line offset from the surface a cable is fixed to: idle radius + 2.5 mm. */
 const OFF = CABLE_R + 0.0025;
 /** Radius of the small rounded corners between straight cable runs. */
 export const CABLE_CORNER_R = 0.04;
@@ -59,18 +61,26 @@ const meterTop = METER.pos.y + METER.size[1] / 2;
 const meterLeft = METER.pos.x - METER.size[0] / 2;
 const meterRight = METER.pos.x + METER.size[0] / 2;
 
-// Solar: lowest corner of the array (bottom-right panel) -> along the frame edge to the eave ->
-// over the fascia -> under the soffit to the wall -> down the front wall -> meter top.
+// Solar: lowest front corner of the array (bottom-right panel) -> down the front roof surface to
+// the eave -> straight down in front of the fascia (never under the soffit, so the default camera
+// sees all of it) -> back to the front wall -> meter top.
 const SOLAR_X = ARRAY_RIGHT_X + 0.04; // beside the frame edge, never over a panel
 const SLAB_END = ROOF_SLAB.length / 2 + FASCIA.thick + OFF; // outside the eave fascia
 const TOP_H = ROOF_SLAB.thick / 2 + OFF;
-const BOTTOM_H = -(ROOF_SLAB.thick / 2 + OFF);
-/** s at which the soffit run meets the wall plane z = WALL_Z. */
-const SOFFIT_S = (WALL_Z - FRONT_SLAB_CENTER.z - slopeNormal.z * BOTTOM_H) / slopeDown.z;
+const SOLAR_WALL_Y = 2.2;
 export const SOLAR_JUNCTION = roofPoint(SOLAR_X + 0.015, ARRAY_LOW_S - 0.32, ROOF_SLAB.thick / 2 + 0.02);
 
-// Service drop: house-side insulator on the post crossarm -> bracket under the front eave.
-export const DROP_BRACKET = { x: 3.28, y: 2.3, out: 0.15 };
+// Service drop: house-side insulator on the post crossarm -> bracket under the garage eave,
+// 0.3 from the garage roof's front corner on the post side (x = 8.3), on the blank wall strip right
+// of the door frame. (The strip next to the house/garage corner is hidden by the main house, which
+// stands 0.4 in front of the garage, so a bracket there still read as "attached at the roof corner".)
+export const GARAGE_BRACKET = { x: GARAGE.x1 + 0.1 - 0.3, y: 2.36, out: 0.15 };
+/** Height of the run along the garage wall, above the garage door frame (top at 2.24). */
+const GARAGE_RUN_Y = 2.3;
+/** Where the grid run turns down the front wall toward the meter (right of the solar cable). */
+const GRID_DROP_X = 3.95;
+const GARAGE_WALL_Z = GARAGE.z1 + OFF;
+const GRID_RUN_Y = 1.95;
 export const POST_INSULATOR = v(POST.pos.x - 0.55, POST.height - 0.17 + OFF, POST.pos.z);
 
 // Meter -> house: enters the wall through a gland just left of the meter.
@@ -82,10 +92,9 @@ export const CABLE_POINTS = {
   solar: [
     roofPoint(SOLAR_X, ARRAY_LOW_S - 0.3, TOP_H),
     roofPoint(SOLAR_X, SLAB_END, TOP_H),
-    roofPoint(SOLAR_X, SLAB_END, BOTTOM_H),
-    roofPoint(SOLAR_X, SOFFIT_S, BOTTOM_H),
-    v(SOLAR_X, 2.2, WALL_Z),
-    v(3.5, 2.2, WALL_Z),
+    v(SOLAR_X, SOLAR_WALL_Y, roofPoint(SOLAR_X, SLAB_END, TOP_H).z),
+    v(SOLAR_X, SOLAR_WALL_Y, WALL_Z),
+    v(3.5, SOLAR_WALL_Y, WALL_Z),
     v(3.5, meterTop - 0.02, WALL_Z),
   ],
   // meter -> battery (meter right side, along the wall, up into the battery bottom)
@@ -103,11 +112,17 @@ export const CABLE_POINTS = {
     v(WALL_GLAND.x, WALL_GLAND.y, WALL_Z),
     v(WALL_GLAND.x, WALL_GLAND.y, MAIN.z1 - 0.01),
   ],
-  // meter -> utility post: up the wall to the eave bracket, then one straight overhead span
+  // meter -> utility post: up the front wall, round the corner, along the garage wall above the
+  // door, up to the garage eave bracket, then one straight overhead span to the post top
   grid: [
-    v(DROP_BRACKET.x, meterTop - 0.02, WALL_Z),
-    v(DROP_BRACKET.x, DROP_BRACKET.y, WALL_Z),
-    v(DROP_BRACKET.x, DROP_BRACKET.y, MAIN.z1 + DROP_BRACKET.out),
+    v(meterRight - 0.02, GRID_RUN_Y, WALL_Z),
+    v(GRID_DROP_X, GRID_RUN_Y, WALL_Z),
+    v(GRID_DROP_X, GARAGE_RUN_Y, WALL_Z),
+    v(MAIN.x1 + OFF, GARAGE_RUN_Y, WALL_Z),
+    v(MAIN.x1 + OFF, GARAGE_RUN_Y, GARAGE_WALL_Z),
+    v(GARAGE_BRACKET.x, GARAGE_RUN_Y, GARAGE_WALL_Z),
+    v(GARAGE_BRACKET.x, GARAGE_BRACKET.y, GARAGE_WALL_Z),
+    v(GARAGE_BRACKET.x, GARAGE_BRACKET.y, GARAGE.z1 + GARAGE_BRACKET.out),
     POST_INSULATOR.clone(),
   ],
 };
@@ -156,6 +171,78 @@ export const ANCHORS = {
   postTop: POST.pos.clone().add(new THREE.Vector3(0, POST.height, 0)),
   window: new THREE.Vector3(FRONT_WINDOWS_X[0], 1.55, MAIN.z1 + 0.06),
 };
+
+// ---------- projected bounds ----------
+const box = (x0: number, x1: number, y0: number, y1: number, z0: number, z1: number) => {
+  const out: THREE.Vector3[] = [];
+  for (const x of [x0, x1]) for (const y of [y0, y1]) for (const z of [z0, z1]) out.push(v(x, y, z));
+  return out;
+};
+const roofCorners = (() => {
+  const out: THREE.Vector3[] = [];
+  const hx = ROOF_SLAB.width / 2 + FASCIA.thick;
+  const hs = ROOF_SLAB.length / 2 + FASCIA.thick;
+  for (const x of [-hx, hx]) for (const s of [-hs, hs]) for (const h of [-1, 1]) {
+    const p = roofPoint(x, s, (h * ROOF_SLAB.thick) / 2);
+    out.push(p, v(p.x, p.y, -p.z)); // front slab and its mirrored back slab
+  }
+  return out;
+})();
+
+/** 3D bounding boxes of the house (main volume, both roof slabs, ridge, garage, door step). */
+export const HOUSE_BOX_POINTS: THREE.Vector3[] = [
+  ...box(MAIN.x0, MAIN.x1, 0, MAIN.wall, MAIN.z0, MAIN.z1),
+  ...roofCorners,
+  ...box(-ROOF_SLAB.width / 2 - FASCIA.thick, ROOF_SLAB.width / 2 + FASCIA.thick, MAIN.ridge, MAIN.ridge + 0.14, -0.11, 0.11),
+  ...box(GARAGE.x0 - 0.1, GARAGE.x1 + 0.1 + FASCIA.thick, 0, GARAGE.h + 0.14, GARAGE.z0 - 0.05, GARAGE.z1 + 0.15 + FASCIA.thick),
+  ...box(DOOR_X - 0.8, DOOR_X + 0.8, 0, 0.1, MAIN.z1, MAIN.z1 + 0.76),
+];
+
+/** Everything the canvas frames: the house plus the utility post. */
+export const MODEL_POINTS: THREE.Vector3[] = [
+  ...HOUSE_BOX_POINTS,
+  ...box(POST.pos.x - 0.7, POST.pos.x + 0.7, 0, POST.height, POST.pos.z - 0.1, POST.pos.z + 0.1),
+];
+
+export interface Framing {
+  width: number;
+  height: number;
+  fov: number; // vertical, degrees
+  offsetX: number; // setViewOffset x (px)
+  offsetY: number; // setViewOffset y (px)
+}
+
+/**
+ * Canvas framing for the default camera pose: the model's projected bounds fill the width minus
+ * padX on each side, the canvas is the model's projected height plus padY above and below, and
+ * the model is centred in both directions (via the camera view offset, the pose is unchanged).
+ */
+export function computeFraming(width: number, padX: number, padY: number): Framing {
+  const cam = new THREE.PerspectiveCamera();
+  cam.position.copy(CAM_POS);
+  cam.lookAt(TARGET);
+  cam.updateMatrixWorld(true);
+  const inv = cam.matrixWorldInverse;
+  let u0 = Infinity, u1 = -Infinity, w0 = Infinity, w1 = -Infinity;
+  const q = new THREE.Vector3();
+  for (const p of MODEL_POINTS) {
+    q.copy(p).applyMatrix4(inv);
+    const u = q.x / -q.z;
+    const w = q.y / -q.z;
+    u0 = Math.min(u0, u); u1 = Math.max(u1, u);
+    w0 = Math.min(w0, w); w1 = Math.max(w1, w);
+  }
+  const scale = Math.max(1, width - 2 * padX) / (u1 - u0); // px per unit of view slope
+  const height = Math.round(scale * (w1 - w0) + 2 * padY);
+  const fov = (2 * Math.atan(height / 2 / scale) * 180) / Math.PI;
+  return {
+    width,
+    height,
+    fov,
+    offsetX: scale * ((u0 + u1) / 2),
+    offsetY: -scale * ((w0 + w1) / 2),
+  };
+}
 
 // Camera: 3/4 front-left view, ~25° elevation, fov 28
 export const TARGET = new THREE.Vector3(2.4, 1.85, 0.7);

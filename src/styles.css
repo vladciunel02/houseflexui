@@ -256,10 +256,9 @@ button:disabled {
 .scene-stage {
   grid-column: 1;
   grid-row: 1 / 5;
+  align-self: end;
   position: relative;
-  height: 500px;
   width: 100%;
-  overflow: hidden;
 }
 
 .scene-canvas-host {
@@ -274,8 +273,8 @@ button:disabled {
 
 .scene-bottom {
   position: absolute;
-  left: var(--space-4);
-  bottom: var(--space-4);
+  left: 0;
+  top: calc(100% + var(--space-4));
   z-index: 3;
 }
 
@@ -996,8 +995,9 @@ button:disabled {
     gap: var(--space-5);
   }
 
-  .scene-stage {
-    height: 320px;
+  .scene-bottom {
+    position: static;
+    margin-top: var(--space-4);
   }
 
   .info-block {

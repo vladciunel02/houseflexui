@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import {
   PAST_MONTH_SAVED_LEI,
@@ -85,8 +85,6 @@ export function HouseView({
 }: Props) {
   const minute = useMinute();
   const s = snapshot(today, activeSim, minute);
-  const [resetSignal, setResetSignal] = useState(0);
-  const resetLinkRef = useRef<HTMLDivElement>(null);
   const [confirmingCancel, setConfirmingCancel] = useState(false);
   const [toast, setToast] = useState(false);
   const reduced = prefersReducedMotion();
@@ -163,23 +161,7 @@ export function HouseView({
 
         {/* ---------- 2. 3D House Stage (left 58% on desktop; under "Acum" at 320px on mobile) ---------- */}
         <div className="scene-stage">
-          <HouseScene
-            house={today}
-            sim={activeSim}
-            cloudStart={cloudStart}
-            resetSignal={resetSignal}
-            avoidRef={resetLinkRef}
-          />
-
-          <div className="scene-bottom" ref={resetLinkRef}>
-            <button
-              type="button"
-              className="btn-tertiary"
-              onClick={() => setResetSignal((n) => n + 1)}
-            >
-              Resetează vederea
-            </button>
-          </div>
+          <HouseScene house={today} sim={activeSim} cloudStart={cloudStart} />
 
           <AnimatePresence>
             {toast && (

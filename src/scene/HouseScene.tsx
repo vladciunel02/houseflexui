@@ -1,11 +1,22 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { ContactShadows, OrbitControls } from '@react-three/drei';
 import * as THREE from 'three';
 import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib';
 import { House, type HoverKey } from './House';
 import { AnchorProjector, SceneLabels, useLabelRefs } from './Labels';
-import { CAM_AZIMUTH, CAM_DIST, CAM_POS, TARGET, nightness, sunElevation } from './geometry';
+import {
+  CAM_AZIMUTH,
+  CAM_DIST,
+  CAM_POS,
+  GARAGE,
+  MAIN,
+  TARGET,
+  computeFraming,
+  nightness,
+  sunElevation,
+  type Framing,
+} from './geometry';
 import { CLOUD_MINUTES, type House as HouseData, type Sim } from '../data/mockFleet';
 import { timeStore, prefersReducedMotion } from '../state/time';
 import { readToken } from '../styles/tokens';
@@ -14,10 +25,23 @@ interface Props {
   house: HouseData;
   sim: Sim;
   cloudStart: number | null;
-  resetSignal: number;
-  /** Overlay element (the "Resetează vederea" link) that labels must keep clear of. */
-  avoidRef?: React.RefObject<HTMLElement | null>;
 }
+
+/** Padding around the model's projected bounds inside the canvas (px). */
+const FRAME_PAD_X = 48;
+// Vertical padding also holds the label slots above the ridge (two-line labels), so it is 68 px.
+const FRAME_PAD_Y = 68;
+
+// House footprint (main volume + garage) for the contact shadow
+const FOOT = {
+  cx: (MAIN.x0 + GARAGE.x1) / 2,
+  cz: (MAIN.z0 + MAIN.z1) / 2,
+  w: GARAGE.x1 - MAIN.x0,
+  d: MAIN.z1 - MAIN.z0,
+};
+// Shadow plane centred on the origin that still covers the 1.4x footprint (centred on FOOT)
+const SHADOW_W = 2 * (Math.abs(FOOT.cx) + (FOOT.w * 1.4) / 2);
+const SHADOW_D = 2 * (Math.abs(FOOT.cz) + (FOOT.d * 1.4) / 2);
 
 /** One hemisphere light (sky white, ground roof grey) + one directional sun light; 35% dimmer at night. */
 function Lights({ house, sim }: { house: HouseData; sim: Sim }) {
@@ -119,20 +143,10 @@ function Cloud({ cloudStart }: { cloudStart: number | null }) {
 function Controls({ resetSignal }: { resetSignal: number }) {
   const ref = useRef<OrbitControlsImpl>(null);
   const resetting = useRef(false);
-  const { camera, size } = useThree();
+  const { camera } = useThree();
   useEffect(() => {
     if (resetSignal > 0) resetting.current = true;
   }, [resetSignal]);
-
-  useEffect(() => {
-    if (!(camera instanceof THREE.PerspectiveCamera)) return;
-    const aspect = size.width / Math.max(1, size.height);
-    const nextFov = aspect < 1.42 ? Math.min(39, 28 * (1.42 / Math.max(0.85, aspect))) : 28;
-    if (Math.abs(camera.fov - nextFov) > 0.05) {
-      camera.fov = nextFov;
-      camera.updateProjectionMatrix();
-    }
-  }, [camera, size.width, size.height]);
   useFrame((_, dt) => {
     if (!resetting.current || !ref.current) return;
     const k = prefersReducedMotion() ? 1 : 1 - Math.exp(-dt * 6);
@@ -160,54 +174,88 @@ function Controls({ resetSignal }: { resetSignal: number }) {
   );
 }
 
-export const HouseScene = memo(function HouseScene({ house, sim, cloudStart, resetSignal, avoidRef }: Props) {
+/** Applies the canvas framing: fov and a view offset that centres the model (camera pose unchanged). */
+function FrameCamera({ framing }: { framing: Framing }) {
+  const { camera, size } = useThree();
+  useLayoutEffect(() => {
+    if (!(camera instanceof THREE.PerspectiveCamera)) return;
+    camera.fov = framing.fov;
+    camera.setViewOffset(size.width, size.height, framing.offsetX, framing.offsetY, size.width, size.height);
+    camera.updateProjectionMatrix();
+  }, [camera, framing, size.width, size.height]);
+  return null;
+}
+
+export const HouseScene = memo(function HouseScene({ house, sim, cloudStart }: Props) {
   const [hovered, setHovered] = useState<HoverKey>(null);
+  const [resetSignal, setResetSignal] = useState(0);
   const refs = useLabelRefs();
-  const [batteryUp, setBatteryUp] = useState(false);
   const shadowColor = useMemo(() => readToken('--color-text'), []);
+  const hostRef = useRef<HTMLDivElement>(null);
+  const [framing, setFraming] = useState<Framing>(() => computeFraming(800, FRAME_PAD_X, FRAME_PAD_Y));
+
+  // Canvas height = the model's projected height + padding, recomputed when the stage width changes
+  useLayoutEffect(() => {
+    const el = hostRef.current;
+    if (!el) return;
+    const measure = () => {
+      const w = Math.round(el.clientWidth);
+      if (w > 0) setFraming((f) => (f.width === w ? f : computeFraming(w, FRAME_PAD_X, FRAME_PAD_Y)));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   useEffect(() => () => void (document.body.style.cursor = ''), []);
 
   return (
-    <div className="scene-canvas-host">
-      <Canvas
-        dpr={[1, 2]}
-        camera={{ fov: 28, position: CAM_POS.toArray(), near: 1, far: 140 }}
-        gl={{
-          alpha: true,
-          antialias: true,
-          powerPreference: 'high-performance',
-          toneMapping: THREE.NoToneMapping,
-        }}
-        onCreated={({ gl }) => {
-          // Transparent canvas (clear alpha 0, nothing drawn behind the model): the page shows through
-          gl.setClearColor(readToken('--color-page'), 0);
-        }}
-        onPointerMissed={() => setHovered(null)}
-      >
-        <Lights house={house} sim={sim} />
-        <House house={house} sim={sim} hovered={hovered} setHovered={setHovered} />
-        <ContactShadows
-          frames={1}
-          position={[2.2, 0.005, 0.6]}
-          scale={22}
-          opacity={0.22}
-          blur={2.5}
-          far={5.5}
-          resolution={512}
-          color={shadowColor}
-        />
-        <Cloud cloudStart={cloudStart} />
-        <AnchorProjector
-          refs={refs}
-          hovered={hovered}
-          avoidRef={avoidRef}
-          batteryUp={batteryUp}
-          onBatteryUp={setBatteryUp}
-        />
-        <Controls resetSignal={resetSignal} />
-      </Canvas>
-      <SceneLabels refs={refs} hovered={hovered} house={house} sim={sim} batteryUp={batteryUp} />
-    </div>
+    <>
+      <div className="scene-canvas-host" ref={hostRef} style={{ height: framing.height }}>
+        <Canvas
+          dpr={[1, 2]}
+          camera={{ fov: framing.fov, position: CAM_POS.toArray(), near: 1, far: 140 }}
+          gl={{
+            alpha: true,
+            antialias: true,
+            powerPreference: 'high-performance',
+            toneMapping: THREE.NoToneMapping,
+          }}
+          onCreated={({ gl }) => {
+            // Transparent canvas (clear alpha 0, nothing drawn behind the model): the page shows through
+            gl.setClearColor(readToken('--color-page'), 0);
+          }}
+          onPointerMissed={() => setHovered(null)}
+        >
+          <FrameCamera framing={framing} />
+          <Lights house={house} sim={sim} />
+          <House house={house} sim={sim} hovered={hovered} setHovered={setHovered} />
+          {/* Contact shadow, 0.001 below the house base, covering 1.4x the house footprint. Placed at
+              the world origin: away from x = z = 0 drei's ContactShadows draws its shadow shifted by its
+              offset (it showed as a dark patch beside the house), so the plane is widened instead. */}
+          <ContactShadows
+            frames={1}
+            position={[0, -0.001, 0]}
+            scale={[SHADOW_W, SHADOW_D]}
+            opacity={0.3}
+            blur={2}
+            far={4}
+            resolution={1024}
+            color={shadowColor}
+          />
+          <Cloud cloudStart={cloudStart} />
+          <AnchorProjector refs={refs} hovered={hovered} />
+          <Controls resetSignal={resetSignal} />
+        </Canvas>
+        <SceneLabels refs={refs} hovered={hovered} house={house} sim={sim} />
+      </div>
+      {/* 16px under the canvas, bottom-left */}
+      <div className="scene-bottom">
+        <button type="button" className="btn-tertiary" onClick={() => setResetSignal((n) => n + 1)}>
+          Resetează vederea
+        </button>
+      </div>
+    </>
   );
 });

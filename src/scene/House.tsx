@@ -7,8 +7,9 @@ import {
   CABLES,
   CABLE_POINTS,
   CABLE_R,
+  CABLE_R_ACTIVE,
   DOOR_X,
-  DROP_BRACKET,
+  GARAGE_BRACKET,
   FASCIA,
   FRONT_WINDOWS_X,
   GARAGE,
@@ -151,11 +152,13 @@ export function House({ house, sim, hovered, setHovered }: Props) {
 
   // Straight polyline tubes; enough segments for the small rounded corners to stay round.
   const tubeFor = (path: THREE.CurvePath<THREE.Vector3>, r: number) =>
-    new THREE.TubeGeometry(path, Math.ceil(path.getLength() * 90) + path.curves.length * 6, r, 10, false);
+    new THREE.TubeGeometry(path, Math.ceil(path.getLength() * 90) + path.curves.length * 6, r, 12, false);
+  // Built at the active radius; the cable shader shrinks it to the idle radius. (Any pass that skips
+  // the shader, e.g. the contact-shadow depth pass, still sees a realistic 0.03 tube.)
   const tubes = useMemo(
     () =>
       Object.fromEntries(
-        Object.entries(CABLES).map(([k, c]) => [k, tubeFor(c, CABLE_R)]),
+        Object.entries(CABLES).map(([k, c]) => [k, tubeFor(c, CABLE_R_ACTIVE)]),
       ) as Record<FlowKey, THREE.TubeGeometry>,
     [],
   );
@@ -356,12 +359,12 @@ export function House({ house, sim, hovered, setHovered }: Props) {
       <mesh position={[WALL_GLAND.x, WALL_GLAND.y, MAIN.z1 + 0.012]} rotation={[Math.PI / 2, 0, 0]} material={fasciaMat}>
         <cylinderGeometry args={[0.032, 0.036, 0.024, 16]} />
       </mesh>
-      {/* service drop bracket under the eave, with a small insulator at its tip */}
-      <mesh position={[DROP_BRACKET.x, DROP_BRACKET.y, MAIN.z1 + DROP_BRACKET.out / 2]} material={fasciaMat}>
-        <boxGeometry args={[0.04, 0.04, DROP_BRACKET.out]} />
+      {/* service drop bracket under the garage eave, with a small insulator at its tip */}
+      <mesh position={[GARAGE_BRACKET.x, GARAGE_BRACKET.y, GARAGE.z1 + GARAGE_BRACKET.out / 2]} material={fasciaMat}>
+        <boxGeometry args={[0.04, 0.04, GARAGE_BRACKET.out]} />
       </mesh>
-      <mesh position={[DROP_BRACKET.x, DROP_BRACKET.y, MAIN.z1 + DROP_BRACKET.out]} material={fasciaMat}>
-        <sphereGeometry args={[0.03, 12, 8]} />
+      <mesh position={[GARAGE_BRACKET.x, GARAGE_BRACKET.y, GARAGE.z1 + GARAGE_BRACKET.out]} material={fasciaMat}>
+        <sphereGeometry args={[0.035, 12, 8]} />
       </mesh>
       {/* junction box at the lowest panel corner, where the solar cable starts */}
       <mesh position={SOLAR_JUNCTION} rotation={[ROOF_ANGLE, 0, 0]} material={fasciaMat}>
@@ -392,14 +395,15 @@ export function House({ house, sim, hovered, setHovered }: Props) {
         ))}
       </group>
 
-      {/* ---------- cable tubes with UV pulse shader ---------- */}
+      {/* ---------- cables: idle thin grey, active thick in the flow colour with a moving segment ---------- */}
       {(Object.keys(tubes) as FlowKey[]).map((k) => (
-        <PulseCable key={k} geometry={tubes[k]} kind={k} house={house} sim={sim} />
+        <FlowCable key={k} geometry={tubes[k]} kind={k} house={house} sim={sim} />
       ))}
     </group>
   );
 }
 
+/** Power on each cable (kW, sign = direction along the cable's points) and its flow colour. */
 function cableFlow(
   kind: FlowKey,
   s: Snapshot,
@@ -410,11 +414,13 @@ function cableFlow(
       return { kw: s.solar, color: pal.solar };
     case 'battery':
       return { kw: s.charge - s.discharge, color: pal.battery };
-    case 'house':
-      return {
-        kw: s.load,
-        color: s.discharge > 0.05 && s.discharge >= s.imp ? pal.battery : pal.grid,
-      };
+    case 'house': {
+      // coloured by the source that covers most of the load right now
+      const fromSolar = Math.max(0, s.load - s.discharge - s.imp);
+      const color =
+        s.discharge >= s.imp && s.discharge >= fromSolar ? pal.battery : s.imp >= fromSolar ? pal.grid : pal.solar;
+      return { kw: s.load, color };
+    }
     case 'grid':
       return s.exp > 0.005
         ? { kw: s.exp, color: s.price < 0 ? pal.neg : pal.grid }
@@ -422,8 +428,22 @@ function cableFlow(
   }
 }
 
-/** Tube mesh with base --model-cable color and traveling UV pulse shader. */
-function PulseCable({
+/** Below this |power| a cable is idle. */
+const ACTIVE_KW = 0.05;
+/** Idle <-> active transition time (s). */
+const TRANSITION_S = 0.3;
+/** Length of the moving lighter segment, as a share of the cable length. */
+const SEGMENT_SHARE = 0.2;
+/** Power at which the segment reaches its top speed (kW). */
+const FULL_SPEED_KW = 3.5;
+
+/**
+ * Cable with a readable energy direction. Idle: thin (0.012) in --model-cable. Active: thick (0.03)
+ * solid flow colour, plus one lighter segment (20 % of the path, flow colour 50 % toward white)
+ * travelling along the energy direction at 0.25-1.0 path lengths per second, scaled with power.
+ * Flat shading only: no glow, bloom, emissive halo or particles.
+ */
+function FlowCable({
   geometry,
   kind,
   house,
@@ -434,7 +454,6 @@ function PulseCable({
   house: HouseData;
   sim: Sim;
 }) {
-  const length = useMemo(() => CABLES[kind].getLength(), [kind]);
   const pal = useMemo(
     () => ({
       solar: threeColor('--color-yellow'),
@@ -444,70 +463,92 @@ function PulseCable({
     }),
     [],
   );
+  const idleColor = useMemo(() => threeColor('--model-cable'), []);
 
   const mat = useMemo(
     () =>
       new THREE.ShaderMaterial({
         toneMapped: false,
         uniforms: {
-          uBase: { value: threeColor('--model-cable') },
-          uPulse: { value: threeColor('--color-blue') },
-          uPhase: { value: 0 },
+          uRadius: { value: CABLE_R },
+          uBuiltRadius: { value: CABLE_R_ACTIVE },
+          uColor: { value: idleColor.clone() },
+          uSegColor: { value: idleColor.clone() },
+          uSegAmount: { value: 0 },
+          uHead: { value: 0 },
           uDir: { value: 1 },
-          uStrength: { value: 0 },
-          uFreq: { value: Math.max(2, Math.round(length * 0.85)) },
+          uSegLen: { value: SEGMENT_SHARE },
         },
         vertexShader: /* glsl */ `
+          uniform float uRadius;
+          uniform float uBuiltRadius;
           varying vec2 vUv;
           varying vec3 vNormalW;
           void main() {
             vUv = uv;
             vNormalW = normalize(mat3(modelMatrix) * normal);
-            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            // The tube is built at uBuiltRadius around the centre line; move each vertex to uRadius.
+            vec3 p = position + normal * (uRadius - uBuiltRadius);
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
           }
         `,
         fragmentShader: /* glsl */ `
-          uniform vec3 uBase;
-          uniform vec3 uPulse;
-          uniform float uPhase;
+          uniform vec3 uColor;
+          uniform vec3 uSegColor;
+          uniform float uSegAmount;
+          uniform float uHead;
           uniform float uDir;
-          uniform float uStrength;
-          uniform float uFreq;
+          uniform float uSegLen;
           varying vec2 vUv;
           varying vec3 vNormalW;
           void main() {
             float diff = 0.84 + 0.16 * clamp(dot(vNormalW, normalize(vec3(-0.3, 0.9, 0.4))), 0.0, 1.0);
-            vec3 baseCol = uBase * diff;
-            float wave = pow(0.5 + 0.5 * cos(6.2831853 * (vUv.x * uFreq - uPhase * uDir)), 6.0);
-            // Base stays pure --model-cable between pulses (no tint along the tube); the pulse is a
-            // separate layer on top, reaching the exact flow colour at its crest.
-            float pulse = wave * smoothstep(0.0, 0.35, uStrength);
-            vec3 col = baseCol * (1.0 - pulse) + uPulse * pulse;
+            // Distance behind the segment's leading edge, measured against the flow direction.
+            float d = fract((uHead - vUv.x) * uDir);
+            float seg = smoothstep(0.0, 0.01, d) * (1.0 - smoothstep(uSegLen - 0.01, uSegLen, d));
+            vec3 col = mix(uColor, uSegColor, seg * uSegAmount) * diff;
             gl_FragColor = vec4(col, 1.0);
-            // Uniform colours are linear: convert to the sRGB output, otherwise #FFC502 shows as orange-brown
             #include <colorspace_fragment>
           }
         `,
       }),
-    [length],
+    [idleColor],
   );
 
-  const kwSmooth = useRef(0);
-  const phase = useRef(0);
+  const active = useRef(0); // 0 idle .. 1 active, linear over TRANSITION_S
+  const flowColor = useRef(new THREE.Color().copy(idleColor));
+  const head = useRef(0);
+  const dir = useRef(1);
+  const tmp = useMemo(() => ({ seg: new THREE.Color(), white: new THREE.Color(1, 1, 1) }), []);
 
   useFrame((_, dt) => {
     const s = snapshot(house, sim, timeStore.get());
     const f = cableFlow(kind, s, pal);
-    kwSmooth.current += (f.kw - kwSmooth.current) * (1 - Math.exp(-dt * 8));
-    const mag = Math.abs(kwSmooth.current);
-    const speed = (0.7 + 0.35 * mag) / Math.max(1.8, length * 0.35);
-    if (!prefersReducedMotion()) {
-      phase.current = (phase.current + dt * speed) % 1;
+    const mag = Math.abs(f.kw);
+    const target = mag >= ACTIVE_KW ? 1 : 0;
+    const step = Math.min(1, dt / TRANSITION_S);
+    const gap = target - active.current;
+    active.current += Math.sign(gap) * Math.min(Math.abs(gap), step);
+    if (target === 1) {
+      // snap the colour when starting from idle, otherwise blend over the same 300 ms
+      flowColor.current.lerp(f.color, active.current <= step + 1e-6 ? 1 : step);
+      dir.current = f.kw >= 0 ? 1 : -1;
     }
-    mat.uniforms.uPhase.value = phase.current;
-    mat.uniforms.uDir.value = kwSmooth.current >= 0 ? 1 : -1;
-    mat.uniforms.uStrength.value = mag < 0.03 ? 0 : Math.min(1, 0.35 + mag * 0.22);
-    mat.uniforms.uPulse.value.lerp(f.color, 0.25);
+    const a = active.current;
+
+    // Speed: 0.25 .. 1.0 path lengths per second, scaled with power
+    const speed = 0.25 + 0.75 * Math.min(1, mag / FULL_SPEED_KW);
+    if (!prefersReducedMotion()) head.current = (head.current + dir.current * speed * dt + 1) % 1;
+
+    // Lighter segment: flow colour mixed 50 % toward white (in sRGB, as seen)
+    tmp.seg.copy(flowColor.current).convertLinearToSRGB().lerp(tmp.white, 0.5).convertSRGBToLinear();
+
+    mat.uniforms.uRadius.value = CABLE_R + (CABLE_R_ACTIVE - CABLE_R) * a;
+    mat.uniforms.uColor.value.copy(idleColor).lerp(flowColor.current, a);
+    mat.uniforms.uSegColor.value.copy(tmp.seg);
+    mat.uniforms.uSegAmount.value = a;
+    mat.uniforms.uHead.value = head.current;
+    mat.uniforms.uDir.value = dir.current;
   });
 
   return <mesh geometry={geometry} material={mat} />;
